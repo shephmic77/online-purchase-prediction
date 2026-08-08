@@ -1,0 +1,1326 @@
+---
+title: "Predicting Online Purchase Intention and Discovering Shopper Segments"
+author: "Michael Shepherd"
+output:
+  pdf_document:
+    toc: false
+    number_sections: true
+    fig_caption: true
+geometry: margin=0.65in
+fontsize: 9pt
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+  - \usepackage{float}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.pos = "H",
+  out.width = "88%"
+)
+
+required_packages <- c(
+  "tidyverse", "broom", "pROC", "class", "knitr", "scales"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Install these packages before knitting: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+library(tidyverse)
+library(broom)
+library(pROC)
+library(class)
+library(knitr)
+
+set.seed(380)
+
+theme_set(
+  theme_minimal(base_size = 9) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      legend.position = "bottom"
+    )
+)
+
+options(dplyr.summarise.inform = FALSE)
+```
+
+```{r analysis-engine, include=FALSE}
+# -----------------------------
+# 1. Import and data preparation
+# -----------------------------
+
+data_url <- paste0(
+  "https://archive.ics.uci.edu/ml/machine-learning-databases/",
+  "00468/online_shoppers_intention.csv"
+)
+
+shop_raw <- read.csv(data_url, stringsAsFactors = FALSE)
+
+quantitative_predictors <- c(
+  "Administrative", "Administrative_Duration",
+  "Informational", "Informational_Duration",
+  "ProductRelated", "ProductRelated_Duration",
+  "BounceRates", "ExitRates", "PageValues", "SpecialDay"
+)
+
+categorical_predictors <- c(
+  "Month", "OperatingSystems", "Browser", "Region",
+  "TrafficType", "VisitorType", "Weekend"
+)
+
+all_predictors <- c(quantitative_predictors, categorical_predictors)
+
+expected_columns <- c(all_predictors, "Revenue")
+
+if (!all(expected_columns %in% names(shop_raw))) {
+  stop("The imported dataset does not contain all expected columns.")
+}
+
+shop <- shop_raw %>%
+  mutate(
+    row_id = row_number(),
+    across(all_of(categorical_predictors), factor),
+    Revenue = factor(Revenue, levels = c(FALSE, TRUE))
+  )
+
+# Explicit reference levels for logistic regression.
+shop <- shop %>%
+  mutate(
+    Month = relevel(Month, ref = "Nov"),
+    OperatingSystems = relevel(OperatingSystems, ref = "2"),
+    Browser = relevel(Browser, ref = "2"),
+    Region = relevel(Region, ref = "1"),
+    TrafficType = relevel(TrafficType, ref = "2"),
+    VisitorType = relevel(VisitorType, ref = "Returning_Visitor"),
+    Weekend = relevel(Weekend, ref = "FALSE")
+  )
+
+missing_count <- sum(is.na(shop))
+duplicate_count <- sum(duplicated(shop_raw))
+
+impossible_checks <- tibble(
+  Check = c(
+    "Negative page counts",
+    "Negative page durations",
+    "BounceRates outside [0,1]",
+    "ExitRates outside [0,1]",
+    "SpecialDay outside [0,1]",
+    "Negative PageValues"
+  ),
+  Count = c(
+    sum(shop$Administrative < 0 |
+          shop$Informational < 0 |
+          shop$ProductRelated < 0),
+    sum(shop$Administrative_Duration < 0 |
+          shop$Informational_Duration < 0 |
+          shop$ProductRelated_Duration < 0),
+    sum(shop$BounceRates < 0 | shop$BounceRates > 1),
+    sum(shop$ExitRates < 0 | shop$ExitRates > 1),
+    sum(shop$SpecialDay < 0 | shop$SpecialDay > 1),
+    sum(shop$PageValues < 0)
+  )
+)
+
+structure_table <- tibble(
+  Variable = names(shop)[names(shop) != "row_id"],
+  Class = vapply(
+    shop[names(shop) != "row_id"],
+    function(x) paste(class(x), collapse = "/"),
+    character(1)
+  ),
+  Missing = vapply(
+    shop[names(shop) != "row_id"],
+    function(x) sum(is.na(x)),
+    numeric(1)
+  )
+)
+
+class_balance <- shop %>%
+  count(Revenue) %>%
+  mutate(Proportion = n / sum(n))
+
+naive_accuracy <- max(class_balance$Proportion)
+
+# -----------------------------
+# 2. Stratified 70/15/15 split
+# -----------------------------
+
+stratified_split <- function(data, outcome, train_prop = 0.70, val_prop = 0.15) {
+  outcome_vec <- data[[outcome]]
+  outcome_levels <- levels(outcome_vec)
+
+  split_one_class <- function(level_value) {
+    ids <- which(outcome_vec == level_value)
+    ids <- sample(ids)
+
+    n_train <- floor(length(ids) * train_prop)
+    n_val <- floor(length(ids) * val_prop)
+
+    list(
+      train = ids[seq_len(n_train)],
+      validation = ids[seq.int(n_train + 1, n_train + n_val)],
+      test = ids[seq.int(n_train + n_val + 1, length(ids))]
+    )
+  }
+
+  pieces <- lapply(outcome_levels, split_one_class)
+
+  train_ids <- unlist(lapply(pieces, `[[`, "train"))
+  validation_ids <- unlist(lapply(pieces, `[[`, "validation"))
+  test_ids <- unlist(lapply(pieces, `[[`, "test"))
+
+  list(
+    train = data %>% filter(row_id %in% train_ids),
+    validation = data %>% filter(row_id %in% validation_ids),
+    test = data %>% filter(row_id %in% test_ids)
+  )
+}
+
+set.seed(380)
+splits <- stratified_split(shop, "Revenue")
+train <- splits$train
+validation <- splits$validation
+test <- splits$test
+
+split_summary <- bind_rows(
+  train %>% summarise(Set = "Training", Rows = n(),
+                      PurchaseRate = mean(Revenue == "TRUE")),
+  validation %>% summarise(Set = "Validation", Rows = n(),
+                           PurchaseRate = mean(Revenue == "TRUE")),
+  test %>% summarise(Set = "Test", Rows = n(),
+                     PurchaseRate = mean(Revenue == "TRUE"))
+)
+
+pairwise_overlap <- tibble(
+  Pair = c("Training vs validation", "Training vs test", "Validation vs test"),
+  SharedRows = c(
+    length(intersect(train$row_id, validation$row_id)),
+    length(intersect(train$row_id, test$row_id)),
+    length(intersect(validation$row_id, test$row_id))
+  )
+)
+
+# -----------------------------
+# 3. Metrics helpers
+# -----------------------------
+
+safe_divide <- function(numerator, denominator) {
+  ifelse(denominator == 0, NA_real_, numerator / denominator)
+}
+
+classification_metrics <- function(truth, prediction, positive = "TRUE") {
+  truth <- factor(truth, levels = c("FALSE", "TRUE"))
+  prediction <- factor(prediction, levels = c("FALSE", "TRUE"))
+
+  cm <- table(
+    Predicted = prediction,
+    Actual = truth
+  )
+
+  tn <- unname(cm["FALSE", "FALSE"])
+  fn <- unname(cm["FALSE", "TRUE"])
+  fp <- unname(cm["TRUE", "FALSE"])
+  tp <- unname(cm["TRUE", "TRUE"])
+
+  tibble(
+    TN = tn,
+    FN = fn,
+    FP = fp,
+    TP = tp,
+    accuracy = safe_divide(tp + tn, tp + tn + fp + fn),
+    sensitivity = safe_divide(tp, tp + fn),
+    specificity = safe_divide(tn, tn + fp),
+    precision = safe_divide(tp, tp + fp),
+    misclassification_rate = safe_divide(fp + fn, tp + tn + fp + fn),
+    balanced_accuracy = mean(
+      c(
+        safe_divide(tp, tp + fn),
+        safe_divide(tn, tn + fp)
+      ),
+      na.rm = TRUE
+    )
+  )
+}
+
+confusion_matrix_table <- function(truth, prediction) {
+  as.data.frame.matrix(
+    table(
+      `Predicted class` = factor(prediction, levels = c("FALSE", "TRUE")),
+      `Actual class` = factor(truth, levels = c("FALSE", "TRUE"))
+    )
+  ) %>%
+    rownames_to_column("Predicted")
+}
+
+# -----------------------------
+# 4. Logistic regression
+# -----------------------------
+
+logistic_formula <- as.formula(
+  paste("Revenue ~", paste(all_predictors, collapse = " + "))
+)
+
+logistic_model <- glm(
+  logistic_formula,
+  data = train,
+  family = binomial()
+)
+
+logistic_coefficients <- tidy(
+  logistic_model,
+  conf.int = TRUE,
+  exponentiate = TRUE
+) %>%
+  filter(term != "(Intercept)") %>%
+  arrange(p.value) %>%
+  slice_head(n = 15) %>%
+  transmute(
+    Term = term,
+    OddsRatio = estimate,
+    CI_Lower = conf.low,
+    CI_Upper = conf.high,
+    P_Value = p.value
+  )
+
+reference_levels <- tibble(
+  Predictor = categorical_predictors,
+  Baseline = vapply(
+    train[categorical_predictors],
+    function(x) levels(x)[1],
+    character(1)
+  )
+)
+
+validation_logistic_prob <- predict(
+  logistic_model,
+  newdata = validation,
+  type = "response"
+)
+
+validation_roc <- roc(
+  response = validation$Revenue,
+  predictor = validation_logistic_prob,
+  levels = c("FALSE", "TRUE"),
+  direction = "<",
+  quiet = TRUE
+)
+
+validation_auc <- as.numeric(auc(validation_roc))
+
+roc_coords <- coords(
+  validation_roc,
+  x = "all",
+  ret = c("threshold", "sensitivity", "specificity"),
+  transpose = FALSE
+) %>%
+  as_tibble() %>%
+  mutate(
+    distance_to_top_left = sqrt((1 - sensitivity)^2 + (1 - specificity)^2)
+  )
+
+chosen_logistic_threshold <- roc_coords %>%
+  filter(is.finite(threshold)) %>%
+  slice_min(distance_to_top_left, n = 1, with_ties = FALSE) %>%
+  pull(threshold)
+
+logistic_validation_predictions <- tibble(
+  Threshold = c("0.50", "ROC closest to top-left"),
+  NumericThreshold = c(0.50, chosen_logistic_threshold)
+) %>%
+  mutate(
+    Prediction = map(
+      NumericThreshold,
+      ~ factor(
+        ifelse(validation_logistic_prob >= .x, "TRUE", "FALSE"),
+        levels = c("FALSE", "TRUE")
+      )
+    )
+  )
+
+logistic_validation_metrics <- logistic_validation_predictions %>%
+  mutate(
+    Metrics = map(
+      Prediction,
+      ~ classification_metrics(validation$Revenue, .x)
+    )
+  ) %>%
+  select(-Prediction) %>%
+  unnest(Metrics)
+
+logistic_cm_050 <- confusion_matrix_table(
+  validation$Revenue,
+  logistic_validation_predictions$Prediction[[1]]
+)
+
+logistic_cm_chosen <- confusion_matrix_table(
+  validation$Revenue,
+  logistic_validation_predictions$Prediction[[2]]
+)
+
+# Contextual odds-ratio interpretations.
+logit_terms <- tidy(logistic_model)
+
+beta_product_duration <- logit_terms %>%
+  filter(term == "ProductRelated_Duration") %>%
+  pull(estimate)
+
+or_product_duration_100 <- exp(beta_product_duration * 100)
+
+beta_weekend <- logit_terms %>%
+  filter(term == "WeekendTRUE") %>%
+  pull(estimate)
+
+or_weekend <- ifelse(length(beta_weekend) == 1, exp(beta_weekend), NA_real_)
+
+beta_new_visitor <- logit_terms %>%
+  filter(term == "VisitorTypeNew_Visitor") %>%
+  pull(estimate)
+
+or_new_visitor <- ifelse(
+  length(beta_new_visitor) == 1,
+  exp(beta_new_visitor),
+  NA_real_
+)
+
+# -----------------------------
+# 5. KNN preprocessing
+# -----------------------------
+
+design_formula <- as.formula(
+  paste("~", paste(all_predictors, collapse = " + "), "- 1")
+)
+
+build_design_matrix <- function(data, formula, reference_columns = NULL) {
+  matrix_out <- model.matrix(formula, data = data)
+
+  if (!is.null(reference_columns)) {
+    missing_columns <- setdiff(reference_columns, colnames(matrix_out))
+    extra_columns <- setdiff(colnames(matrix_out), reference_columns)
+
+    if (length(missing_columns) > 0) {
+      zero_block <- matrix(
+        0,
+        nrow = nrow(matrix_out),
+        ncol = length(missing_columns),
+        dimnames = list(NULL, missing_columns)
+      )
+      matrix_out <- cbind(matrix_out, zero_block)
+    }
+
+    if (length(extra_columns) > 0) {
+      matrix_out <- matrix_out[
+        , setdiff(colnames(matrix_out), extra_columns), drop = FALSE
+      ]
+    }
+
+    matrix_out <- matrix_out[, reference_columns, drop = FALSE]
+  }
+
+  matrix_out
+}
+
+x_train_raw <- build_design_matrix(train, design_formula)
+design_columns <- colnames(x_train_raw)
+
+x_validation_raw <- build_design_matrix(
+  validation, design_formula, design_columns
+)
+
+x_test_raw <- build_design_matrix(
+  test, design_formula, design_columns
+)
+
+training_centers <- colMeans(x_train_raw)
+training_scales <- apply(x_train_raw, 2, sd)
+training_scales[is.na(training_scales) | training_scales == 0] <- 1
+
+standardize_with_training <- function(matrix_in) {
+  matrix_in <- sweep(matrix_in, 2, training_centers, "-")
+  sweep(matrix_in, 2, training_scales, "/")
+}
+
+x_train <- standardize_with_training(x_train_raw)
+x_validation <- standardize_with_training(x_validation_raw)
+x_test <- standardize_with_training(x_test_raw)
+
+y_train <- train$Revenue
+y_validation <- validation$Revenue
+y_test <- test$Revenue
+
+# -----------------------------
+# 6. Stratified 10-fold CV for KNN
+# -----------------------------
+
+make_stratified_folds <- function(y, v = 10, seed = 380) {
+  set.seed(seed)
+  fold_id <- integer(length(y))
+
+  for (class_level in levels(y)) {
+    ids <- which(y == class_level)
+    ids <- sample(ids)
+    fold_id[ids] <- rep(seq_len(v), length.out = length(ids))
+  }
+
+  fold_id
+}
+
+fold_id <- make_stratified_folds(y_train, v = 10, seed = 380)
+candidate_k <- seq(1, 31, by = 2)
+
+knn_cv_results <- map_dfr(candidate_k, function(k_value) {
+  fold_metrics <- map_dfr(seq_len(10), function(fold_number) {
+    analysis_rows <- fold_id != fold_number
+    assessment_rows <- fold_id == fold_number
+
+    prediction <- knn(
+      train = x_train[analysis_rows, , drop = FALSE],
+      test = x_train[assessment_rows, , drop = FALSE],
+      cl = y_train[analysis_rows],
+      k = k_value
+    )
+
+    classification_metrics(
+      truth = y_train[assessment_rows],
+      prediction = prediction
+    )
+  })
+
+  tibble(
+    k = k_value,
+    misclassification_rate = mean(
+      fold_metrics$misclassification_rate, na.rm = TRUE
+    ),
+    sensitivity = mean(fold_metrics$sensitivity, na.rm = TRUE),
+    specificity = mean(fold_metrics$specificity, na.rm = TRUE),
+    balanced_accuracy = mean(
+      fold_metrics$balanced_accuracy, na.rm = TRUE
+    )
+  )
+})
+
+best_balanced_accuracy <- max(knn_cv_results$balanced_accuracy)
+
+near_tie_knn <- knn_cv_results %>%
+  filter(balanced_accuracy >= best_balanced_accuracy - 0.005) %>%
+  arrange(desc(balanced_accuracy), k)
+
+selected_knn_k <- near_tie_knn %>%
+  slice_max(k, n = 1, with_ties = FALSE) %>%
+  pull(k)
+
+knn_validation_prediction <- knn(
+  train = x_train,
+  test = x_validation,
+  cl = y_train,
+  k = selected_knn_k
+)
+
+knn_validation_metrics <- classification_metrics(
+  y_validation,
+  knn_validation_prediction
+) %>%
+  mutate(Model = paste0("KNN (k = ", selected_knn_k, ")"), .before = 1)
+
+knn_validation_cm <- confusion_matrix_table(
+  y_validation,
+  knn_validation_prediction
+)
+
+# -----------------------------
+# 7. Final predictive model choice
+# -----------------------------
+
+chosen_logistic_validation_metrics <- logistic_validation_metrics %>%
+  filter(Threshold == "ROC closest to top-left") %>%
+  mutate(
+    Model = paste0(
+      "Logistic (threshold = ",
+      round(chosen_logistic_threshold, 3),
+      ")"
+    ),
+    .before = 1
+  )
+
+validation_model_comparison <- bind_rows(
+  chosen_logistic_validation_metrics,
+  knn_validation_metrics
+) %>%
+  arrange(
+    desc(balanced_accuracy),
+    desc(sensitivity),
+    desc(accuracy)
+  )
+
+final_model_name <- validation_model_comparison$Model[1]
+final_model_type <- ifelse(
+  grepl("^Logistic", final_model_name),
+  "logistic",
+  "knn"
+)
+
+if (final_model_type == "logistic") {
+  final_test_prob <- predict(
+    logistic_model,
+    newdata = test,
+    type = "response"
+  )
+
+  final_test_prediction <- factor(
+    ifelse(
+      final_test_prob >= chosen_logistic_threshold,
+      "TRUE",
+      "FALSE"
+    ),
+    levels = c("FALSE", "TRUE")
+  )
+
+  final_test_roc <- roc(
+    response = test$Revenue,
+    predictor = final_test_prob,
+    levels = c("FALSE", "TRUE"),
+    direction = "<",
+    quiet = TRUE
+  )
+
+  final_test_auc <- as.numeric(auc(final_test_roc))
+} else {
+  final_test_prediction <- knn(
+    train = x_train,
+    test = x_test,
+    cl = y_train,
+    k = selected_knn_k
+  )
+  final_test_auc <- NA_real_
+}
+
+final_test_metrics <- classification_metrics(
+  y_test,
+  final_test_prediction
+)
+
+final_test_cm <- confusion_matrix_table(
+  y_test,
+  final_test_prediction
+)
+
+# -----------------------------
+# 8. Strict response-free K-means
+# -----------------------------
+
+# Revenue is deliberately absent from this object before choosing K.
+cluster_data <- shop %>%
+  select(all_of(quantitative_predictors))
+
+cluster_scaled <- scale(cluster_data)
+
+set.seed(380)
+wss_table <- map_dfr(1:10, function(k_value) {
+  fit <- kmeans(
+    cluster_scaled,
+    centers = k_value,
+    nstart = 25,
+    iter.max = 100
+  )
+
+  tibble(
+    K = k_value,
+    TotalWithinSS = fit$tot.withinss
+  )
+})
+
+# Automated elbow: maximum perpendicular distance from the line joining K=1 and K=10.
+x <- wss_table$K
+y <- wss_table$TotalWithinSS
+
+x_scaled_elbow <- (x - min(x)) / (max(x) - min(x))
+y_scaled_elbow <- (y - min(y)) / (max(y) - min(y))
+
+x1 <- x_scaled_elbow[1]
+y1 <- y_scaled_elbow[1]
+x2 <- x_scaled_elbow[length(x_scaled_elbow)]
+y2 <- y_scaled_elbow[length(y_scaled_elbow)]
+
+distance_from_line <- abs(
+  (y2 - y1) * x_scaled_elbow -
+    (x2 - x1) * y_scaled_elbow +
+    x2 * y1 - y2 * x1
+) / sqrt((y2 - y1)^2 + (x2 - x1)^2)
+
+eligible_elbow <- which(wss_table$K >= 2 & wss_table$K <= 9)
+final_k <- wss_table$K[
+  eligible_elbow[which.max(distance_from_line[eligible_elbow])]
+]
+
+set.seed(380)
+final_kmeans <- kmeans(
+  cluster_scaled,
+  centers = final_k,
+  nstart = 50,
+  iter.max = 100
+)
+
+cluster_assignments <- final_kmeans$cluster
+
+cluster_profile_z <- as_tibble(cluster_scaled) %>%
+  mutate(Cluster = cluster_assignments) %>%
+  group_by(Cluster) %>%
+  summarise(across(everything(), mean), .groups = "drop")
+
+cluster_profile_raw <- shop %>%
+  select(all_of(quantitative_predictors)) %>%
+  mutate(Cluster = cluster_assignments) %>%
+  group_by(Cluster) %>%
+  summarise(
+    Size = n(),
+    across(everything(), mean),
+    .groups = "drop"
+  )
+
+name_cluster <- function(profile_row) {
+  values <- unlist(profile_row[quantitative_predictors])
+  names(values) <- quantitative_predictors
+
+  if (mean(values[c("BounceRates", "ExitRates")]) > 0.60) {
+    return("Quick-exit sessions")
+  }
+
+  if (mean(values[c("ProductRelated", "ProductRelated_Duration")]) > 0.60) {
+    return("Intensive product browsers")
+  }
+
+  if (mean(values[c("Informational", "Informational_Duration")]) > 0.60) {
+    return("Information seekers")
+  }
+
+  if (mean(values[c("Administrative", "Administrative_Duration")]) > 0.60) {
+    return("Administrative-focused sessions")
+  }
+
+  if (values["PageValues"] > 0.60) {
+    return("High-value engagement")
+  }
+
+  if (values["SpecialDay"] > 0.60) {
+    return("Special-day visitors")
+  }
+
+  if (mean(values[c("BounceRates", "ExitRates")]) < -0.40) {
+    return("Low-exit engaged sessions")
+  }
+
+  "Typical browsing sessions"
+}
+
+cluster_names <- cluster_profile_z %>%
+  rowwise() %>%
+  mutate(
+    BehavioralName = paste0(name_cluster(cur_data()), " (C", Cluster, ")")
+  ) %>%
+  ungroup() %>%
+  select(Cluster, BehavioralName)
+
+cluster_profile_display <- cluster_profile_z %>%
+  left_join(cluster_names, by = "Cluster") %>%
+  select(Cluster, BehavioralName, everything())
+
+# A transposed version is easier to read in the report: variables are rows, clusters are columns.
+cluster_profile_compact <- cluster_profile_z %>%
+  pivot_longer(
+    cols = -Cluster,
+    names_to = "Variable",
+    values_to = "MeanZ"
+  ) %>%
+  mutate(Cluster = paste0("C", Cluster)) %>%
+  pivot_wider(names_from = Cluster, values_from = MeanZ)
+
+cluster_sizes <- tibble(
+  Cluster = seq_len(final_k),
+  Size = as.integer(final_kmeans$size)
+) %>%
+  left_join(cluster_names, by = "Cluster")
+
+cluster_posthoc <- shop %>%
+  transmute(
+    Cluster = cluster_assignments,
+    Revenue = Revenue
+  ) %>%
+  group_by(Cluster) %>%
+  summarise(
+    Sessions = n(),
+    PurchaseRate = mean(Revenue == "TRUE"),
+    .groups = "drop"
+  ) %>%
+  left_join(cluster_names, by = "Cluster")
+
+cluster_plot_data <- shop %>%
+  select(all_of(quantitative_predictors)) %>%
+  mutate(
+    Cluster = factor(cluster_assignments),
+    BehavioralName = factor(
+      cluster_names$BehavioralName[
+        match(cluster_assignments, cluster_names$Cluster)
+      ]
+    )
+  )
+```
+
+# Executive Summary
+
+This project analyzes `r scales::comma(nrow(shop))` online shopping sessions from the UCI Online Shoppers Purchasing Intention Dataset. The first objective is to predict whether a session ends in a purchase, with purchase (`Revenue = TRUE`) treated as the positive class. The second objective is to discover behavioral shopper segments without using the purchase outcome. After data-quality checks, the observations were divided into stratified training, validation, and test sets. Logistic regression and K-nearest neighbors were developed using only the training data, while tuning decisions and the logistic probability threshold were made using validation performance. The untouched test set was used only after all choices were fixed. The final predictive model was **`r final_model_name`**. It achieved test accuracy of **`r scales::percent(final_test_metrics$accuracy, accuracy = 0.1)`**, sensitivity of **`r scales::percent(final_test_metrics$sensitivity, accuracy = 0.1)`**, specificity of **`r scales::percent(final_test_metrics$specificity, accuracy = 0.1)`**, and balanced accuracy of **`r scales::percent(final_test_metrics$balanced_accuracy, accuracy = 0.1)`**. For segmentation, K-means was applied only to the ten genuinely quantitative predictors after standardization. The elbow diagnostic selected **`r final_k` clusters**. These clusters differed in browsing intensity, engagement, and exit behavior, and their post-hoc purchase rates also varied. Browsing behavior therefore contains useful predictive information, although class imbalance and the assumptions of both logistic regression and K-means limit interpretation.
+
+# A. Data Understanding and Exploratory Analysis
+
+## A1. Import, structure, and data quality
+
+```{r a1-tables}
+kable(
+  tibble(
+    Item = c(
+      "Rows",
+      "Columns excluding row_id",
+      "Missing values",
+      "Exact duplicate records"
+    ),
+    Value = c(
+      nrow(shop),
+      ncol(shop) - 1,
+      missing_count,
+      duplicate_count
+    )
+  ),
+  caption = "Dataset dimensions and basic data-quality checks."
+)
+
+```
+
+The imported dataset contains `r scales::comma(nrow(shop))` sessions and `r ncol(shop) - 1` analysis variables. The ten genuinely quantitative predictors were stored as integer or numeric variables. The seven categorical predictors and binary response were converted to factors. Operating-system, browser, region, and traffic-type codes were retained as category labels rather than treated as measurements. There were `r missing_count` missing values and `r duplicate_count` exact duplicate records. Checks found no negative page counts or durations, no rates outside 0 to 1, no SpecialDay values outside 0 to 1, and no negative PageValues. Exact duplicates were retained because each row represents a recorded session, and identical observed values do not prove that two records describe the same event. No observations were silently deleted.
+
+## A2. Class balance and naive benchmark
+
+```{r a2-table}
+kable(
+  class_balance,
+  digits = 4,
+  caption = "Counts and proportions of purchase outcomes."
+)
+```
+
+```{r a2-plot, fig.height=3.0}
+ggplot(class_balance, aes(x = Revenue, y = n, fill = Revenue)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(
+    aes(label = scales::comma(n)),
+    vjust = -0.3
+  ) +
+  scale_y_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0, 0.10))
+  ) +
+  labs(
+    title = "Purchase outcomes are strongly imbalanced",
+    x = "Session ended in a purchase",
+    y = "Number of sessions"
+  )
+```
+
+The naive majority-class classifier has accuracy of `r scales::percent(naive_accuracy, accuracy = 0.1)`. That accuracy is misleading because the classifier never predicts a purchase and therefore has zero sensitivity for the positive class.
+
+## A3. Exploratory visual analysis
+
+### Distributions of quantitative variables
+
+```{r a3-distributions, fig.height=4.6}
+distribution_vars <- c(
+  "Administrative",
+  "ProductRelated",
+  "ProductRelated_Duration",
+  "PageValues"
+)
+
+shop %>%
+  select(all_of(distribution_vars)) %>%
+  pivot_longer(
+    everything(),
+    names_to = "Variable",
+    values_to = "Value"
+  ) %>%
+  ggplot(aes(x = Value)) +
+  geom_histogram(bins = 35, boundary = 0) +
+  facet_wrap(~ Variable, scales = "free", ncol = 2) +
+  labs(
+    title = "Distributions of selected browsing variables",
+    x = "Observed value",
+    y = "Number of sessions"
+  )
+```
+
+The selected page-count, duration, and page-value variables are strongly right-skewed. Most sessions show modest activity, while a small number show very high engagement.
+
+### Purchase rates for categorical predictors
+
+```{r a3-categorical, fig.height=4.6}
+categorical_eda_vars <- c("Month", "VisitorType", "Weekend")
+
+shop %>%
+  select(all_of(categorical_eda_vars), Revenue) %>%
+  pivot_longer(
+    cols = all_of(categorical_eda_vars),
+    names_to = "Predictor",
+    values_to = "Level"
+  ) %>%
+  group_by(Predictor, Level) %>%
+  summarise(
+    Sessions = n(),
+    PurchaseRate = mean(Revenue == "TRUE"),
+    .groups = "drop"
+  ) %>%
+  ggplot(
+    aes(
+      x = reorder(Level, PurchaseRate),
+      y = PurchaseRate
+    )
+  ) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~ Predictor, scales = "free_y", ncol = 1) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Purchase rates across categorical predictor levels",
+    x = "Category level",
+    y = "Observed purchase rate"
+  )
+```
+
+Purchase rates differ across months and visitor types, while the weekend difference is more modest. These are descriptive comparisons rather than causal effects.
+
+### Quantitative predictors by outcome
+
+```{r a3-outcome, fig.height=4.6}
+outcome_compare_vars <- c(
+  "ProductRelated",
+  "PageValues",
+  "ExitRates"
+)
+
+shop %>%
+  select(all_of(outcome_compare_vars), Revenue) %>%
+  pivot_longer(
+    cols = all_of(outcome_compare_vars),
+    names_to = "Predictor",
+    values_to = "Value"
+  ) %>%
+  ggplot(aes(x = Revenue, y = Value)) +
+  geom_boxplot(outlier.alpha = 0.10) +
+  facet_wrap(~ Predictor, scales = "free_y", ncol = 1) +
+  labs(
+    title = "Selected quantitative predictors by purchase outcome",
+    x = "Session ended in a purchase",
+    y = "Observed value"
+  )
+```
+
+Purchasing sessions tend to show higher `PageValues` and more product-related browsing, while exit rates tend to be lower. Considerable overlap remains between the two outcome groups.
+
+### Correlation display
+
+```{r a3-correlation, fig.height=4.6}
+cor_matrix <- cor(
+  shop %>% select(all_of(quantitative_predictors)),
+  use = "pairwise.complete.obs"
+)
+
+as.data.frame(as.table(cor_matrix)) %>%
+  rename(
+    Variable1 = Var1,
+    Variable2 = Var2,
+    Correlation = Freq
+  ) %>%
+  ggplot(
+    aes(
+      x = Variable1,
+      y = Variable2,
+      fill = Correlation
+    )
+  ) +
+  geom_tile() +
+  geom_text(
+    aes(label = sprintf("%.2f", Correlation)),
+    size = 2.3
+  ) +
+  scale_fill_gradient2(
+    low = "navy",
+    mid = "white",
+    high = "firebrick",
+    midpoint = 0,
+    limits = c(-1, 1)
+  ) +
+  coord_equal() +
+  labs(
+    title = "Correlations among genuinely quantitative predictors",
+    x = NULL,
+    y = NULL
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  )
+```
+
+Page counts are positively associated with their corresponding duration measures. `BounceRates` and `ExitRates` are also positively related. These relationships may make individual logistic coefficients less stable.
+
+# B. Data Splitting and Preprocessing
+
+## B1. Training, validation, and test sets
+
+The assignment requires an approximately 70% training and 30% holdout split while also requiring separate validation and test evaluations. The 30% holdout portion was therefore divided evenly, producing an approximately 70/15/15 stratified split.
+
+```{r b1-tables}
+kable(
+  split_summary,
+  digits = 4,
+  caption = "Dimensions and purchase proportions for each split."
+)
+
+kable(
+  pairwise_overlap,
+  caption = "Verification that datasets do not overlap."
+)
+```
+
+Purchase proportions are nearly identical across the three datasets, and all pairwise overlap counts are zero.
+
+## B2. Method-specific preprocessing
+
+Logistic regression uses meaningful factors and the reference levels below.
+
+```{r b2-reference}
+kable(
+  reference_levels,
+  caption = "Reference levels for categorical predictors."
+)
+```
+
+KNN uses a one-hot numeric design matrix. Centering and scaling constants were estimated only from the training data and then applied to validation and test data with the same column structure. Coded values such as browser and region cannot be treated as ordinary numbers because their numerical differences do not represent meaningful behavioral distances.
+
+# C. Logistic Regression
+
+## C1. Main-effects model
+
+The fitted model is:
+
+```{r c1-formula, results='asis'}
+cat("`", deparse(logistic_formula), "`")
+```
+
+Purchase (`Revenue = TRUE`) is the positive class.
+
+```{r c1-coefficients}
+kable(
+  logistic_coefficients %>%
+    slice_head(n = 10) %>%
+    transmute(
+      Term = Term,
+      OR = OddsRatio,
+      `CI low` = CI_Lower,
+      `CI high` = CI_Upper,
+      `p-value` = P_Value
+    ),
+  digits = 3,
+  caption = "Selected logistic-regression odds ratios."
+)
+```
+
+## C2. Coefficient interpretations
+
+Holding all other included predictors constant, an additional 100 seconds on product-related pages multiplies the estimated purchase odds by **`r round(or_product_duration_100, 3)`**.
+
+Holding all other included predictors constant, a weekend session has estimated purchase odds **`r round(or_weekend, 3)` times** those of an otherwise comparable weekday session.
+
+Holding all other included predictors constant, a new visitor has estimated purchase odds **`r round(or_new_visitor, 3)` times** those of an otherwise comparable returning visitor.
+
+These are conditional associations, not causal effects.
+
+## C3. Validation ROC curve, threshold, and confusion metrics
+
+```{r c3-roc, fig.height=3.4}
+plot(
+  validation_roc,
+  main = paste0(
+    "Validation ROC curve for logistic regression (AUC = ",
+    round(validation_auc, 3),
+    ")"
+  ),
+  legacy.axes = TRUE
+)
+
+abline(a = 0, b = 1, lty = 2)
+```
+
+The validation AUC is `r round(validation_auc, 3)`. The ROC threshold closest to the top-left corner is `r round(chosen_logistic_threshold, 3)`.
+
+```{r c3-metrics}
+kable(
+  logistic_validation_metrics %>%
+    transmute(
+      Threshold,
+      Cutoff = NumericThreshold,
+      Accuracy = accuracy,
+      Sensitivity = sensitivity,
+      Specificity = specificity,
+      Precision = precision,
+      `Error rate` = misclassification_rate,
+      `Balanced acc.` = balanced_accuracy
+    ),
+  digits = 3,
+  caption = "Validation metrics for two logistic-regression thresholds."
+)
+```
+
+```{r c3-cm-050}
+kable(
+  logistic_cm_050,
+  caption = "Logistic validation confusion matrix at threshold 0.50. Rows are predicted classes and columns are actual classes."
+)
+```
+
+```{r c3-cm-chosen}
+kable(
+  logistic_cm_chosen,
+  caption = "Logistic validation confusion matrix at the ROC-selected threshold. Rows are predicted classes and columns are actual classes."
+)
+```
+
+For a business use case in which missing a likely purchaser is more costly than showing an unnecessary promotion to a non-purchaser, the ROC-selected threshold is preferred because it provides a better balance between sensitivity and specificity than the default threshold.
+
+## C4. Logistic-model limitations
+
+First, a main-effects logistic model assumes that each quantitative predictor has a linear effect on log-odds and does not automatically represent nonlinear relationships or interactions. Second, the strong class imbalance can make overall accuracy look favorable even when purchase detection is weak. Correlated browsing measures can also make individual coefficients unstable.
+
+# D. K-Nearest Neighbors and 10-Fold Cross-Validation
+
+## D1. Selecting the number of neighbors
+
+```{r d1-cv-table}
+kable(
+  knn_cv_results,
+  digits = 3,
+  caption = "Ten-fold cross-validation results for odd values of k."
+)
+```
+
+```{r d1-cv-plot, fig.height=3.4}
+ggplot(
+  knn_cv_results,
+  aes(x = k, y = balanced_accuracy)
+) +
+  geom_line() +
+  geom_point() +
+  geom_vline(
+    xintercept = selected_knn_k,
+    linetype = 2
+  ) +
+  scale_x_continuous(breaks = candidate_k) +
+  labs(
+    title = "KNN 10-fold cross-validated balanced accuracy",
+    subtitle = paste("Selected k =", selected_knn_k),
+    x = "Number of neighbors, k",
+    y = "Mean balanced accuracy"
+  )
+```
+
+The selected value is `r selected_knn_k`, which had the highest cross-validated balanced accuracy. A value was considered a near-tie if it was within 0.005 of the best balanced accuracy. No larger value of `k` met that rule, so the near-tie rule did not change the selection.
+
+## D2. Validation performance and model comparison
+
+```{r d2-knn-cm}
+kable(
+  knn_validation_cm,
+  caption = "KNN validation confusion matrix. Rows are predicted classes and columns are actual classes."
+)
+```
+
+```{r d2-comparison}
+kable(
+  validation_model_comparison %>%
+    transmute(
+      Model,
+      Accuracy = accuracy,
+      Sensitivity = sensitivity,
+      Specificity = specificity,
+      Precision = precision,
+      `Error rate` = misclassification_rate,
+      `Balanced acc.` = balanced_accuracy
+    ),
+  digits = 3,
+  caption = "Validation comparison of the selected KNN and logistic classifiers."
+)
+```
+
+Based on validation balanced accuracy, sensitivity, and accuracy, the selected final model is **`r final_model_name`**.
+
+## D3. Role of scaling and k
+
+Standardization is essential because KNN is distance-based. Without scaling, variables with large numerical ranges, such as duration, would dominate variables with small ranges, such as bounce rate. Very small values of `k` produce flexible boundaries with low bias but high variance. Very large values produce smoother boundaries with higher bias and lower variance. The cross-validation curve shows where this tradeoff gives the strongest out-of-sample balanced accuracy.
+
+# Final Predictive Evaluation on the Untouched Test Set
+
+The test set was not used for preprocessing estimates, threshold selection, KNN tuning, or model selection.
+
+```{r final-test-metrics}
+kable(
+  final_test_metrics,
+  digits = 3,
+  caption = paste("Untouched test-set metrics for", final_model_name)
+)
+```
+
+```{r final-test-cm}
+kable(
+  final_test_cm,
+  caption = "Final test confusion matrix. Rows are predicted classes and columns are actual classes."
+)
+```
+
+The final model achieved test accuracy of `r scales::percent(final_test_metrics$accuracy, accuracy = 0.1)`, sensitivity of `r scales::percent(final_test_metrics$sensitivity, accuracy = 0.1)`, specificity of `r scales::percent(final_test_metrics$specificity, accuracy = 0.1)`, precision of `r scales::percent(final_test_metrics$precision, accuracy = 0.1)`, and balanced accuracy of `r scales::percent(final_test_metrics$balanced_accuracy, accuracy = 0.1)`.
+
+Because logistic regression was selected, its untouched test-set AUC is `r if (final_model_type == "logistic") round(final_test_auc, 3) else "not applicable"`.
+
+# E. Response-Free K-Means Clustering
+
+## E1. Clustering feature matrix
+
+Before any clustering choice was made, `Revenue` was removed. The clustering matrix contains only the ten genuinely quantitative predictors. Integer-coded categorical variables were excluded because their codes do not define meaningful Euclidean distances. All ten variables were standardized.
+
+## E2. Selecting the number of clusters
+
+```{r e2-wss, fig.height=3.4}
+ggplot(wss_table, aes(x = K, y = TotalWithinSS)) +
+  geom_line() +
+  geom_point() +
+  geom_vline(
+    xintercept = final_k,
+    linetype = 2
+  ) +
+  scale_x_continuous(breaks = 1:10) +
+  labs(
+    title = "Elbow diagnostic for response-free K-means",
+    subtitle = paste("Selected K =", final_k),
+    x = "Number of clusters, K",
+    y = "Best total within-cluster sum of squares"
+  )
+```
+
+The final value is `r final_k`. It was selected as the point with the greatest perpendicular distance from the straight line joining the first and last points of the standardized elbow curve. This identifies the strongest bend, after which additional clusters provide smaller reductions in within-cluster variation.
+
+## E3. Final clustering and behavioral profiles
+
+```{r e3-size}
+kable(
+  cluster_sizes,
+  caption = paste(
+    "Cluster sizes. Total within-cluster variation =",
+    round(final_kmeans$tot.withinss, 1)
+  )
+)
+```
+
+```{r e3-profile}
+kable(
+  cluster_profile_compact,
+  digits = 2,
+  caption = "Cluster profiles: mean standardized values (z-scores)."
+)
+```
+
+The cluster names are based only on their browsing profiles, not on purchase outcome. Positive z-scores indicate above-average values and negative z-scores indicate below-average values. C1 is dominated by high bounce and exit rates, C2 by high SpecialDay values, C3 by high page counts and durations, and C4 is the large group closest to typical browsing behavior.
+
+```{r e3-plot-1, fig.height=3.4}
+ggplot(
+  cluster_plot_data,
+  aes(
+    x = log1p(ProductRelated),
+    y = log1p(ProductRelated_Duration),
+    color = BehavioralName
+  )
+) +
+  geom_point(alpha = 0.35, size = 0.8) +
+  labs(
+    title = "Clusters differ in product-related browsing intensity",
+    x = "log(1 + product-related pages)",
+    y = "log(1 + product-related duration in seconds)",
+    color = "Behavioral segment"
+  ) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE)) +
+  theme(
+    legend.position = "bottom",
+    legend.text = element_text(size = 7),
+    legend.title = element_text(size = 8)
+  )
+```
+
+```{r e3-plot-2, fig.height=3.4}
+ggplot(
+  cluster_plot_data,
+  aes(
+    x = BounceRates,
+    y = ExitRates,
+    color = BehavioralName
+  )
+) +
+  geom_point(alpha = 0.35, size = 0.8) +
+  labs(
+    title = "Clusters differ in bounce and exit behavior",
+    x = "Bounce-rate metric",
+    y = "Exit-rate metric",
+    color = "Behavioral segment"
+  ) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE)) +
+  theme(
+    legend.position = "bottom",
+    legend.text = element_text(size = 7),
+    legend.title = element_text(size = 8)
+  )
+```
+
+The first plot emphasizes differences in product browsing intensity. The second shows how the segments differ in low-engagement and quick-exit behavior.
+
+## E4. Post-hoc purchase interpretation and limitations
+
+Only after the final cluster assignments were fixed was `Revenue` reattached.
+
+```{r e4-posthoc}
+kable(
+  cluster_posthoc,
+  digits = 3,
+  caption = "Post-hoc purchase rates by response-free cluster."
+)
+```
+
+The post-hoc rates show whether behavioral segments also happen to differ in purchase behavior. These differences do not mean that purchase outcome created the clusters.
+
+K-means has several limitations here. It relies on Euclidean distance and tends to favor roughly spherical clusters. It is sensitive to skewness and outliers, both of which are present in the browsing variables. It also excludes useful categorical information, can vary with initialization, and does not provide a uniquely correct value of `K`.
+
+# F. Conclusions, Communication, and Reproducibility
+
+The analysis kept the test set untouched until the final model was chosen and used sensitivity and balanced accuracy because purchases were much less common than non-purchases. Logistic regression performed better than KNN on validation balanced accuracy and was selected as the final classifier. K-means found four browsing groups with different engagement patterns. These groups are useful descriptions of the data, but they should not be treated as fixed or causal customer types.
+
+All random operations use a fixed seed of 380. The source imports the dataset, performs data preparation, reproduces every table and figure, and can be run from a clean R session after the required packages are installed.
+
+# References
+
+Sakar, C., & Kastro, Y. (2018). *Online Shoppers Purchasing Intention Dataset*. UCI Machine Learning Repository. https://doi.org/10.24432/C5F88Q
+
